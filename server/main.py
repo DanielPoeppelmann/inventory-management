@@ -6,12 +6,23 @@ from mock_data import inventory_items, orders, demand_forecasts, backlog_items, 
 
 app = FastAPI(title="Factory Inventory Management System")
 
+# In-memory store for submitted restocking orders (not persisted to JSON)
+restocking_orders: List[dict] = []
+
 # Quarter mapping for date filtering
 QUARTER_MAP = {
     'Q1-2025': ['2025-01', '2025-02', '2025-03'],
     'Q2-2025': ['2025-04', '2025-05', '2025-06'],
     'Q3-2025': ['2025-07', '2025-08', '2025-09'],
     'Q4-2025': ['2025-10', '2025-11', '2025-12']
+}
+
+# Category-based lead times in days
+CATEGORY_LEAD_TIMES = {
+    "Sensors": 14,
+    "Controllers": 21,
+    "Actuators": 10,
+    "Circuit Boards": 28,
 }
 
 def filter_by_month(items: list, month: Optional[str]) -> list:
@@ -89,6 +100,8 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float = 0.0
+    category: str = "Other"
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +132,31 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    total_value: float
+    warehouse: Optional[str] = "San Francisco"
+
+class RestockingOrder(BaseModel):
+    id: str
+    order_number: str
+    customer: str
+    items: List[dict]
+    status: str
+    order_date: str
+    expected_delivery: str
+    total_value: float
+    warehouse: Optional[str] = None
+    category: Optional[str] = None
+    lead_time_days: int
+    is_restocking: bool
 
 # API endpoints
 @app.get("/")
@@ -303,6 +341,67 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.post("/api/restocking-orders", response_model=RestockingOrder, status_code=201)
+def create_restocking_order(request: CreateRestockingOrderRequest):
+    """Create a new restocking order from the Restocking tab."""
+    from datetime import datetime, timedelta
+
+    # Determine lead time as max across all item categories
+    lead_time = 14  # default
+    if request.items:
+        item_lead_times = []
+        for req_item in request.items:
+            matched = next((f for f in demand_forecasts if f["item_sku"] == req_item.sku), None)
+            item_category = matched.get("category", "Other") if matched else "Other"
+            item_lead_times.append(CATEGORY_LEAD_TIMES.get(item_category, 14))
+        lead_time = max(item_lead_times)
+
+    # Derive the primary category from the highest-value item
+    category = "Other"
+    if request.items:
+        highest_value_item = max(request.items, key=lambda i: i.quantity * i.unit_cost)
+        matched = next((f for f in demand_forecasts if f["item_sku"] == highest_value_item.sku), None)
+        if matched:
+            category = matched.get("category", "Other")
+
+    now = datetime.utcnow()
+    expected = now + timedelta(days=lead_time)
+    next_id = len(restocking_orders) + 1
+    order_number = f"RST-2026-{next_id:04d}"
+
+    new_order = {
+        "id": f"rst-{next_id}",
+        "order_number": order_number,
+        "customer": "Internal Restocking",
+        "items": [
+            {
+                "sku": item.sku,
+                "name": item.name,
+                "quantity": item.quantity,
+                "unit_price": item.unit_cost
+            }
+            for item in request.items
+        ],
+        "status": "Submitted",
+        "order_date": now.isoformat(),
+        "expected_delivery": expected.isoformat(),
+        "total_value": round(request.total_value, 2),
+        "warehouse": request.warehouse,
+        "category": category,
+        "lead_time_days": lead_time,
+        "is_restocking": True
+    }
+
+    restocking_orders.append(new_order)
+    return new_order
+
+
+@app.get("/api/restocking-orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    """Get all submitted restocking orders."""
+    return restocking_orders
+
 
 if __name__ == "__main__":
     import uvicorn
